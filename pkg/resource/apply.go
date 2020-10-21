@@ -2,14 +2,12 @@ package resource
 
 import (
 	"bytes"
-	"context"
+	"fmt"
 	"io"
+	"math/rand"
+	"net/http"
 
-	"github.com/jonboulle/clockwork"
-
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/printers"
@@ -56,14 +54,16 @@ func (r *helper) Apply(obj []byte) (ApplyResult, error) {
 		r.logger.WithError(err).Error("failed to setup apply command")
 		return "", err
 	}
-	err = applyOptions.Run()
-	if err != nil {
-		r.logger.WithError(err).
-			WithField("stdout", ioStreams.Out.(*bytes.Buffer).String()).
-			WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Warn("running the apply command failed")
-		return "", err
+	if applyOptions == nil {
+		r.logger.WithError(err).Error("failed to setup applyOptions")
 	}
-	return changeTracker.GetResult(), nil
+	if changeTracker == nil {
+		r.logger.WithError(err).Error("failed to setup apply command")
+	}
+
+	r.mockApply()
+
+	return ConfiguredApplyResult, nil
 }
 
 // ApplyRuntimeObject serializes an object and applies it to the target cluster specified by the kubeconfig.
@@ -125,28 +125,44 @@ func (r *helper) CreateRuntimeObject(obj runtime.Object, scheme *runtime.Scheme)
 	return r.Create(data)
 }
 
+func (r *helper) mockApply() {
+	// do a GET to http://httpwait-default.apps.gshereme-spoke-1.new-installer.openshift.com/?wait=3000
+	// use a random wait time
+	in := []int{100, 200, 300, 100, 200, 300, 100, 200, 300, 100, 200, 300, 500, 500, 3000}
+	randomIndex := rand.Intn(len(in))
+	wait := in[randomIndex]
+
+	r.logger.Debug("running fake apply for ", wait, "ms")
+	url := fmt.Sprintf("http://httpwait-default.apps.gshereme-spoke-1.new-installer.openshift.com/?wait=%d", wait)
+	r.logger.Debug("getting ", url)
+	resp, err := http.Get(url)
+	if err != nil {
+		r.logger.Debug("err: ", err)
+	}
+	defer resp.Body.Close()
+
+	r.logger.Debug("Response status: ", resp.Status)
+}
+
 func (r *helper) createOnly(f cmdutil.Factory, obj []byte) (ApplyResult, error) {
 	info, err := r.getResourceInternalInfo(f, obj)
 	if err != nil {
 		return "", err
 	}
+	if info == nil {
+		r.logger.Debug("err getting info")
+	}
 	c, err := f.DynamicClient()
 	if err != nil {
-		return "", err
+		r.logger.Debug("err getting client")
 	}
-	if err = info.Get(); err != nil {
-		if !errors.IsNotFound(err) {
-			return "", err
-		}
-		// Object doesn't exist yet, create it
-		gvr := info.ResourceMapping().Resource
-		_, err := c.Resource(gvr).Namespace(info.Namespace).Create(context.TODO(), info.Object.(*unstructured.Unstructured), metav1.CreateOptions{})
-		if err != nil {
-			return "", err
-		}
-		return CreatedApplyResult, nil
+	if c == nil {
+		r.logger.Debug("err getting client")
 	}
-	return UnchangedApplyResult, nil
+
+	r.mockApply()
+
+	return CreatedApplyResult, nil
 }
 
 func (r *helper) createOrUpdate(f cmdutil.Factory, obj []byte, errOut io.Writer) (ApplyResult, error) {
@@ -154,44 +170,21 @@ func (r *helper) createOrUpdate(f cmdutil.Factory, obj []byte, errOut io.Writer)
 	if err != nil {
 		return "", err
 	}
-	c, err := f.DynamicClient()
+	client, err := f.DynamicClient()
 	if err != nil {
-		return "", err
+		r.logger.Debug("err getting client")
+	}
+	if client == nil {
+		r.logger.Debug("err getting client")
 	}
 	sourceObj := info.Object.DeepCopyObject()
-	if err = info.Get(); err != nil {
-		if !errors.IsNotFound(err) {
-			return "", err
-		}
-		// Object doesn't exist yet, create it
-		gvr := info.ResourceMapping().Resource
-		_, err := c.Resource(gvr).Namespace(info.Namespace).Create(context.TODO(), info.Object.(*unstructured.Unstructured), metav1.CreateOptions{})
-		if err != nil {
-			return "", err
-		}
-		return CreatedApplyResult, nil
+	if sourceObj == nil {
+		r.logger.Debug("err getting sourceObj")
 	}
-	openAPISchema, _ := f.OpenAPISchema()
-	patcher := kcmdapply.Patcher{
-		Mapping:       info.Mapping,
-		Helper:        kresource.NewHelper(info.Client, info.Mapping),
-		Overwrite:     true,
-		BackOff:       clockwork.NewRealClock(),
-		OpenapiSchema: openAPISchema,
-	}
-	sourceBytes, err := runtime.Encode(unstructured.UnstructuredJSONScheme, sourceObj)
-	if err != nil {
-		return "", err
-	}
-	patch, _, err := patcher.Patch(info.Object, sourceBytes, info.Source, info.Namespace, info.Name, errOut)
-	if err != nil {
-		return "", err
-	}
-	result := ConfiguredApplyResult
-	if string(patch) == "{}" {
-		result = UnchangedApplyResult
-	}
-	return result, nil
+
+	r.mockApply()
+
+	return CreatedApplyResult, nil
 }
 
 func (r *helper) setupApplyCommand(f cmdutil.Factory, obj []byte, ioStreams genericclioptions.IOStreams) (*kcmdapply.ApplyOptions, *changeTracker, error) {

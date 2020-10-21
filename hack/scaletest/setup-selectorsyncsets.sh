@@ -2,7 +2,7 @@
 
 set -e
 
-SYNCSET_COUNT=60
+SYNCSET_COUNT=1
 
 for (( i=0; i<=${SYNCSET_COUNT}; i++ ))
 do
